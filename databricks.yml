@@ -1,0 +1,32 @@
+# Genie Usage & Cost dashboard accelerator (Declarative Automation Bundle)
+bundle:
+  name: genie-usage-cost
+
+variables:
+  warehouse_id:
+    description: SQL warehouse that runs the dashboard queries. Change the name to a warehouse in your workspace.
+    lookup:
+      warehouse: "Serverless Starter Warehouse"
+
+# The dashboard JSON is deployed as a dashboard resource, not synced as a workspace file
+sync:
+  exclude:
+    - src/*.lvdash.json
+
+resources:
+  dashboards:
+    genie_usage_cost:
+      display_name: "Genie Usage & Cost"
+      file_path: ./src/genie_usage_cost.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      # false = each viewer's own permissions are used to read the system tables
+      embed_credentials: false
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

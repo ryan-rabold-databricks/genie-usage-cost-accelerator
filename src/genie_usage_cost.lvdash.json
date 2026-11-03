@@ -1,0 +1,2852 @@
+{
+  "datasets": [
+    {
+      "name": "ds_spend_daily",
+      "displayName": "Genie spend by day",
+      "queryLines": [
+        "WITH\n",
+        "genie_rows AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.workspace_id,\n",
+        "    u.account_id,\n",
+        "    u.cloud,\n",
+        "    u.sku_name,\n",
+        "    u.usage_unit,\n",
+        "    u.usage_end_time,\n",
+        "    u.identity_metadata.run_as AS user_name,\n",
+        "    CASE WHEN u.identity_metadata.run_as LIKE '%@%' THEN 'User' ELSE 'Service principal' END AS principal_type,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_CODE'   THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE'    THEN 'Genie One'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Other')\n",
+        "    END AS product,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, 'UNKNOWN') AS channel,\n",
+        "    CASE WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN 'Free' ELSE 'Billed' END AS billing_type,\n",
+        "    u.usage_quantity AS dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  WHERE u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date BETWEEN :period.min AND :period.max\n",
+        "),\n",
+        "genie_priced AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN COALESCE(ap.pricing.default, lp.pricing.effective_list.default) END AS billed_unit_price_usd,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN r.dbus * COALESCE(ap.pricing.default, lp.pricing.effective_list.default)\n",
+        "         ELSE 0 END AS billed_cost_usd\n",
+        "  FROM genie_rows r\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = r.account_id\n",
+        "    AND ap.sku_name = r.sku_name\n",
+        "    AND ap.cloud = r.cloud\n",
+        "    AND ap.usage_unit = r.usage_unit\n",
+        "    AND ap.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= ap.price_start_time\n",
+        "    AND (ap.price_end_time IS NULL OR r.usage_end_time < ap.price_end_time)\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = r.sku_name\n",
+        "    AND lp.cloud = r.cloud\n",
+        "    AND lp.usage_unit = r.usage_unit\n",
+        "    AND lp.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= lp.price_start_time\n",
+        "    AND (lp.price_end_time IS NULL OR r.usage_end_time < lp.price_end_time)\n",
+        "),\n",
+        "proxy_sku AS (\n",
+        "  SELECT workspace_id, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY workspace_id\n",
+        "),\n",
+        "proxy_sku_cloud AS (\n",
+        "  SELECT cloud, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY cloud\n",
+        "),\n",
+        "free_priced AS (\n",
+        "  SELECT\n",
+        "    f.workspace_id,\n",
+        "    f.cloud,\n",
+        "    f.account_id,\n",
+        "    COALESCE(ps.sku_name, pc.sku_name) AS proxy_sku_name\n",
+        "  FROM (SELECT DISTINCT workspace_id, cloud, account_id FROM genie_rows WHERE billing_type = 'Free') f\n",
+        "  LEFT JOIN proxy_sku ps ON ps.workspace_id = f.workspace_id\n",
+        "  LEFT JOIN proxy_sku_cloud pc ON pc.cloud = f.cloud\n",
+        "),\n",
+        "free_unit_price AS (\n",
+        "  SELECT\n",
+        "    fp.workspace_id,\n",
+        "    COALESCE(ap.pricing.default, lp.pricing.effective_list.default) AS usd_per_dbu\n",
+        "  FROM free_priced fp\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = fp.account_id AND ap.sku_name = fp.proxy_sku_name AND ap.cloud = fp.cloud\n",
+        "    AND ap.currency_code = 'USD' AND ap.price_end_time IS NULL\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = fp.proxy_sku_name AND lp.cloud = fp.cloud\n",
+        "    AND lp.currency_code = 'USD' AND lp.price_end_time IS NULL\n",
+        "),\n",
+        "genie_costed AS (\n",
+        "  SELECT\n",
+        "    p.*,\n",
+        "    CASE WHEN p.billing_type = 'Free'\n",
+        "         THEN p.dbus * fup.usd_per_dbu\n",
+        "         ELSE 0 END AS est_free_value_usd,\n",
+        "    CASE WHEN p.billing_type = 'Billed' THEN p.billed_unit_price_usd ELSE fup.usd_per_dbu END AS unit_price_usd\n",
+        "  FROM genie_priced p\n",
+        "  LEFT JOIN free_unit_price fup ON fup.workspace_id = p.workspace_id\n",
+        "),\n",
+        "workspaces AS (\n",
+        "  SELECT workspace_id, workspace_name FROM system.access.workspaces_latest\n",
+        "),\n",
+        "period_days AS (\n",
+        "  SELECT GREATEST(DATEDIFF(LEAST(CAST(:period.max AS DATE), current_date()), CAST(:period.min AS DATE)) + 1, 1) AS days\n",
+        ")\n",
+        "SELECT\n",
+        "  c.usage_date,\n",
+        "  COALESCE(w.workspace_name, CAST(c.workspace_id AS STRING)) AS workspace_name,\n",
+        "  c.product,\n",
+        "  c.channel,\n",
+        "  c.principal_type,\n",
+        "  c.billing_type,\n",
+        "  SUM(c.dbus)               AS dbus,\n",
+        "  SUM(c.billed_cost_usd)    AS billed_cost_usd,\n",
+        "  SUM(c.est_free_value_usd) AS est_free_value_usd\n",
+        "FROM genie_costed c\n",
+        "LEFT JOIN workspaces w ON w.workspace_id = c.workspace_id\n",
+        "GROUP BY ALL\n",
+        "ORDER BY c.usage_date\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_activity_daily",
+      "displayName": "Genie activity by day",
+      "queryLines": [
+        "WITH\n",
+        "genie_messages AS (\n",
+        "  SELECT\n",
+        "    CAST(e.event_date AS DATE) AS event_date,\n",
+        "    e.workspace_id,\n",
+        "    e.initiated_by AS user_name,\n",
+        "    'Genie Code' AS product,\n",
+        "    'Genie Code' AS mode,\n",
+        "    'UI' AS channel\n",
+        "  FROM system.access.assistant_events e\n",
+        "  WHERE CAST(e.event_date AS DATE) BETWEEN :period.min AND :period.max\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    a.event_date,\n",
+        "    a.workspace_id,\n",
+        "    COALESCE(a.user_identity.email, a.user_identity.subject_name) AS user_name,\n",
+        "    CASE a.service_name WHEN 'aibiGenie' THEN 'Genie Agents' ELSE 'Genie One' END AS product,\n",
+        "    CASE\n",
+        "      WHEN a.action_name IN ('createAgenticResponse', 'genieCreateAgenticResponse') THEN 'Agent mode'\n",
+        "      WHEN a.service_name = 'aibiGenie' THEN 'Chat mode'\n",
+        "      ELSE 'Genie One chat'\n",
+        "    END AS mode,\n",
+        "    CASE WHEN a.service_name = 'aibiGenie' AND a.action_name LIKE 'genie%' THEN 'API' ELSE 'UI' END AS channel\n",
+        "  FROM system.access.audit a\n",
+        "  WHERE a.event_date BETWEEN :period.min AND :period.max\n",
+        "    AND a.response.status_code = 200\n",
+        "    AND (\n",
+        "      (a.service_name = 'aibiGenie' AND a.action_name IN (\n",
+        "          'createConversationMessage', 'createAgenticResponse',\n",
+        "          'genieStartConversationMessage', 'genieCreateConversationMessage',\n",
+        "          'genieCreateAgenticResponse'))\n",
+        "      OR (a.service_name = 'genieChat' AND a.action_name = 'createGenieChatResponse')\n",
+        "    )\n",
+        "),\n",
+        "workspaces AS (SELECT workspace_id, workspace_name FROM system.access.workspaces_latest)\n",
+        "SELECT\n",
+        "  m.event_date,\n",
+        "  COALESCE(w.workspace_name, CAST(m.workspace_id AS STRING)) AS workspace_name,\n",
+        "  m.product,\n",
+        "  m.mode,\n",
+        "  m.channel,\n",
+        "  m.user_name,\n",
+        "  COUNT(*) AS messages\n",
+        "FROM genie_messages m\n",
+        "LEFT JOIN workspaces w ON w.workspace_id = m.workspace_id\n",
+        "GROUP BY ALL\n",
+        "ORDER BY m.event_date\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_workspace_usage",
+      "displayName": "Top workspaces",
+      "queryLines": [
+        "WITH\n",
+        "genie_messages AS (\n",
+        "  SELECT\n",
+        "    CAST(e.event_date AS DATE) AS event_date,\n",
+        "    e.workspace_id,\n",
+        "    e.initiated_by AS user_name,\n",
+        "    'Genie Code' AS product,\n",
+        "    'Genie Code' AS mode,\n",
+        "    'UI' AS channel\n",
+        "  FROM system.access.assistant_events e\n",
+        "  WHERE CAST(e.event_date AS DATE) BETWEEN :period.min AND :period.max\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    a.event_date,\n",
+        "    a.workspace_id,\n",
+        "    COALESCE(a.user_identity.email, a.user_identity.subject_name) AS user_name,\n",
+        "    CASE a.service_name WHEN 'aibiGenie' THEN 'Genie Agents' ELSE 'Genie One' END AS product,\n",
+        "    CASE\n",
+        "      WHEN a.action_name IN ('createAgenticResponse', 'genieCreateAgenticResponse') THEN 'Agent mode'\n",
+        "      WHEN a.service_name = 'aibiGenie' THEN 'Chat mode'\n",
+        "      ELSE 'Genie One chat'\n",
+        "    END AS mode,\n",
+        "    CASE WHEN a.service_name = 'aibiGenie' AND a.action_name LIKE 'genie%' THEN 'API' ELSE 'UI' END AS channel\n",
+        "  FROM system.access.audit a\n",
+        "  WHERE a.event_date BETWEEN :period.min AND :period.max\n",
+        "    AND a.response.status_code = 200\n",
+        "    AND (\n",
+        "      (a.service_name = 'aibiGenie' AND a.action_name IN (\n",
+        "          'createConversationMessage', 'createAgenticResponse',\n",
+        "          'genieStartConversationMessage', 'genieCreateConversationMessage',\n",
+        "          'genieCreateAgenticResponse'))\n",
+        "      OR (a.service_name = 'genieChat' AND a.action_name = 'createGenieChatResponse')\n",
+        "    )\n",
+        "),\n",
+        "genie_rows AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.workspace_id,\n",
+        "    u.account_id,\n",
+        "    u.cloud,\n",
+        "    u.sku_name,\n",
+        "    u.usage_unit,\n",
+        "    u.usage_end_time,\n",
+        "    u.identity_metadata.run_as AS user_name,\n",
+        "    CASE WHEN u.identity_metadata.run_as LIKE '%@%' THEN 'User' ELSE 'Service principal' END AS principal_type,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_CODE'   THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE'    THEN 'Genie One'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Other')\n",
+        "    END AS product,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, 'UNKNOWN') AS channel,\n",
+        "    CASE WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN 'Free' ELSE 'Billed' END AS billing_type,\n",
+        "    u.usage_quantity AS dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  WHERE u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date BETWEEN :period.min AND :period.max\n",
+        "),\n",
+        "genie_priced AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN COALESCE(ap.pricing.default, lp.pricing.effective_list.default) END AS billed_unit_price_usd,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN r.dbus * COALESCE(ap.pricing.default, lp.pricing.effective_list.default)\n",
+        "         ELSE 0 END AS billed_cost_usd\n",
+        "  FROM genie_rows r\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = r.account_id\n",
+        "    AND ap.sku_name = r.sku_name\n",
+        "    AND ap.cloud = r.cloud\n",
+        "    AND ap.usage_unit = r.usage_unit\n",
+        "    AND ap.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= ap.price_start_time\n",
+        "    AND (ap.price_end_time IS NULL OR r.usage_end_time < ap.price_end_time)\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = r.sku_name\n",
+        "    AND lp.cloud = r.cloud\n",
+        "    AND lp.usage_unit = r.usage_unit\n",
+        "    AND lp.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= lp.price_start_time\n",
+        "    AND (lp.price_end_time IS NULL OR r.usage_end_time < lp.price_end_time)\n",
+        "),\n",
+        "proxy_sku AS (\n",
+        "  SELECT workspace_id, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY workspace_id\n",
+        "),\n",
+        "proxy_sku_cloud AS (\n",
+        "  SELECT cloud, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY cloud\n",
+        "),\n",
+        "free_priced AS (\n",
+        "  SELECT\n",
+        "    f.workspace_id,\n",
+        "    f.cloud,\n",
+        "    f.account_id,\n",
+        "    COALESCE(ps.sku_name, pc.sku_name) AS proxy_sku_name\n",
+        "  FROM (SELECT DISTINCT workspace_id, cloud, account_id FROM genie_rows WHERE billing_type = 'Free') f\n",
+        "  LEFT JOIN proxy_sku ps ON ps.workspace_id = f.workspace_id\n",
+        "  LEFT JOIN proxy_sku_cloud pc ON pc.cloud = f.cloud\n",
+        "),\n",
+        "free_unit_price AS (\n",
+        "  SELECT\n",
+        "    fp.workspace_id,\n",
+        "    COALESCE(ap.pricing.default, lp.pricing.effective_list.default) AS usd_per_dbu\n",
+        "  FROM free_priced fp\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = fp.account_id AND ap.sku_name = fp.proxy_sku_name AND ap.cloud = fp.cloud\n",
+        "    AND ap.currency_code = 'USD' AND ap.price_end_time IS NULL\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = fp.proxy_sku_name AND lp.cloud = fp.cloud\n",
+        "    AND lp.currency_code = 'USD' AND lp.price_end_time IS NULL\n",
+        "),\n",
+        "genie_costed AS (\n",
+        "  SELECT\n",
+        "    p.*,\n",
+        "    CASE WHEN p.billing_type = 'Free'\n",
+        "         THEN p.dbus * fup.usd_per_dbu\n",
+        "         ELSE 0 END AS est_free_value_usd,\n",
+        "    CASE WHEN p.billing_type = 'Billed' THEN p.billed_unit_price_usd ELSE fup.usd_per_dbu END AS unit_price_usd\n",
+        "  FROM genie_priced p\n",
+        "  LEFT JOIN free_unit_price fup ON fup.workspace_id = p.workspace_id\n",
+        "),\n",
+        "workspaces AS (\n",
+        "  SELECT workspace_id, workspace_name FROM system.access.workspaces_latest\n",
+        "),\n",
+        "period_days AS (\n",
+        "  SELECT GREATEST(DATEDIFF(LEAST(CAST(:period.max AS DATE), current_date()), CAST(:period.min AS DATE)) + 1, 1) AS days\n",
+        "),\n",
+        "act AS (\n",
+        "  SELECT workspace_id, COUNT(*) AS messages, COUNT(DISTINCT user_name) AS active_users\n",
+        "  FROM genie_messages GROUP BY workspace_id\n",
+        "),\n",
+        "spend AS (\n",
+        "  SELECT workspace_id, SUM(billed_cost_usd) AS billed_cost_usd FROM genie_costed GROUP BY workspace_id\n",
+        ")\n",
+        "SELECT\n",
+        "  COALESCE(w.workspace_name, CAST(a.workspace_id AS STRING)) AS workspace_name,\n",
+        "  a.messages,\n",
+        "  a.active_users,\n",
+        "  COALESCE(s.billed_cost_usd, 0) AS billed_cost_usd\n",
+        "FROM act a\n",
+        "LEFT JOIN spend s ON s.workspace_id = a.workspace_id\n",
+        "LEFT JOIN workspaces w ON w.workspace_id = a.workspace_id\n",
+        "ORDER BY a.messages DESC\n",
+        "LIMIT 15\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_user_heatmap",
+      "displayName": "Top users by day",
+      "queryLines": [
+        "WITH\n",
+        "genie_messages AS (\n",
+        "  SELECT\n",
+        "    CAST(e.event_date AS DATE) AS event_date,\n",
+        "    e.workspace_id,\n",
+        "    e.initiated_by AS user_name,\n",
+        "    'Genie Code' AS product,\n",
+        "    'Genie Code' AS mode,\n",
+        "    'UI' AS channel\n",
+        "  FROM system.access.assistant_events e\n",
+        "  WHERE CAST(e.event_date AS DATE) BETWEEN :period.min AND :period.max\n",
+        "  UNION ALL\n",
+        "  SELECT\n",
+        "    a.event_date,\n",
+        "    a.workspace_id,\n",
+        "    COALESCE(a.user_identity.email, a.user_identity.subject_name) AS user_name,\n",
+        "    CASE a.service_name WHEN 'aibiGenie' THEN 'Genie Agents' ELSE 'Genie One' END AS product,\n",
+        "    CASE\n",
+        "      WHEN a.action_name IN ('createAgenticResponse', 'genieCreateAgenticResponse') THEN 'Agent mode'\n",
+        "      WHEN a.service_name = 'aibiGenie' THEN 'Chat mode'\n",
+        "      ELSE 'Genie One chat'\n",
+        "    END AS mode,\n",
+        "    CASE WHEN a.service_name = 'aibiGenie' AND a.action_name LIKE 'genie%' THEN 'API' ELSE 'UI' END AS channel\n",
+        "  FROM system.access.audit a\n",
+        "  WHERE a.event_date BETWEEN :period.min AND :period.max\n",
+        "    AND a.response.status_code = 200\n",
+        "    AND (\n",
+        "      (a.service_name = 'aibiGenie' AND a.action_name IN (\n",
+        "          'createConversationMessage', 'createAgenticResponse',\n",
+        "          'genieStartConversationMessage', 'genieCreateConversationMessage',\n",
+        "          'genieCreateAgenticResponse'))\n",
+        "      OR (a.service_name = 'genieChat' AND a.action_name = 'createGenieChatResponse')\n",
+        "    )\n",
+        "),\n",
+        "top_users AS (\n",
+        "  SELECT user_name FROM genie_messages\n",
+        "  WHERE user_name LIKE '%@%'\n",
+        "  GROUP BY user_name ORDER BY COUNT(*) DESC LIMIT 25\n",
+        ")\n",
+        "SELECT m.event_date, date_format(m.event_date, 'MM-dd') AS day_label, m.user_name, COUNT(*) AS messages\n",
+        "FROM genie_messages m\n",
+        "JOIN top_users t ON t.user_name = m.user_name\n",
+        "GROUP BY ALL\n",
+        "ORDER BY m.event_date\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_user_tiers",
+      "displayName": "Users with tier",
+      "queryLines": [
+        "WITH\n",
+        "genie_rows AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.workspace_id,\n",
+        "    u.account_id,\n",
+        "    u.cloud,\n",
+        "    u.sku_name,\n",
+        "    u.usage_unit,\n",
+        "    u.usage_end_time,\n",
+        "    u.identity_metadata.run_as AS user_name,\n",
+        "    CASE WHEN u.identity_metadata.run_as LIKE '%@%' THEN 'User' ELSE 'Service principal' END AS principal_type,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_CODE'   THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE'    THEN 'Genie One'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Other')\n",
+        "    END AS product,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, 'UNKNOWN') AS channel,\n",
+        "    CASE WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN 'Free' ELSE 'Billed' END AS billing_type,\n",
+        "    u.usage_quantity AS dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  WHERE u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date BETWEEN :period.min AND :period.max\n",
+        "),\n",
+        "genie_priced AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN COALESCE(ap.pricing.default, lp.pricing.effective_list.default) END AS billed_unit_price_usd,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN r.dbus * COALESCE(ap.pricing.default, lp.pricing.effective_list.default)\n",
+        "         ELSE 0 END AS billed_cost_usd\n",
+        "  FROM genie_rows r\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = r.account_id\n",
+        "    AND ap.sku_name = r.sku_name\n",
+        "    AND ap.cloud = r.cloud\n",
+        "    AND ap.usage_unit = r.usage_unit\n",
+        "    AND ap.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= ap.price_start_time\n",
+        "    AND (ap.price_end_time IS NULL OR r.usage_end_time < ap.price_end_time)\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = r.sku_name\n",
+        "    AND lp.cloud = r.cloud\n",
+        "    AND lp.usage_unit = r.usage_unit\n",
+        "    AND lp.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= lp.price_start_time\n",
+        "    AND (lp.price_end_time IS NULL OR r.usage_end_time < lp.price_end_time)\n",
+        "),\n",
+        "proxy_sku AS (\n",
+        "  SELECT workspace_id, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY workspace_id\n",
+        "),\n",
+        "proxy_sku_cloud AS (\n",
+        "  SELECT cloud, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY cloud\n",
+        "),\n",
+        "free_priced AS (\n",
+        "  SELECT\n",
+        "    f.workspace_id,\n",
+        "    f.cloud,\n",
+        "    f.account_id,\n",
+        "    COALESCE(ps.sku_name, pc.sku_name) AS proxy_sku_name\n",
+        "  FROM (SELECT DISTINCT workspace_id, cloud, account_id FROM genie_rows WHERE billing_type = 'Free') f\n",
+        "  LEFT JOIN proxy_sku ps ON ps.workspace_id = f.workspace_id\n",
+        "  LEFT JOIN proxy_sku_cloud pc ON pc.cloud = f.cloud\n",
+        "),\n",
+        "free_unit_price AS (\n",
+        "  SELECT\n",
+        "    fp.workspace_id,\n",
+        "    COALESCE(ap.pricing.default, lp.pricing.effective_list.default) AS usd_per_dbu\n",
+        "  FROM free_priced fp\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = fp.account_id AND ap.sku_name = fp.proxy_sku_name AND ap.cloud = fp.cloud\n",
+        "    AND ap.currency_code = 'USD' AND ap.price_end_time IS NULL\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = fp.proxy_sku_name AND lp.cloud = fp.cloud\n",
+        "    AND lp.currency_code = 'USD' AND lp.price_end_time IS NULL\n",
+        "),\n",
+        "genie_costed AS (\n",
+        "  SELECT\n",
+        "    p.*,\n",
+        "    CASE WHEN p.billing_type = 'Free'\n",
+        "         THEN p.dbus * fup.usd_per_dbu\n",
+        "         ELSE 0 END AS est_free_value_usd,\n",
+        "    CASE WHEN p.billing_type = 'Billed' THEN p.billed_unit_price_usd ELSE fup.usd_per_dbu END AS unit_price_usd\n",
+        "  FROM genie_priced p\n",
+        "  LEFT JOIN free_unit_price fup ON fup.workspace_id = p.workspace_id\n",
+        "),\n",
+        "workspaces AS (\n",
+        "  SELECT workspace_id, workspace_name FROM system.access.workspaces_latest\n",
+        "),\n",
+        "period_days AS (\n",
+        "  SELECT GREATEST(DATEDIFF(LEAST(CAST(:period.max AS DATE), current_date()), CAST(:period.min AS DATE)) + 1, 1) AS days\n",
+        "),\n",
+        "per_user AS (\n",
+        "  SELECT\n",
+        "    user_name,\n",
+        "    MAX_BY(workspace_id, dbus) AS primary_workspace_id,\n",
+        "    MAX_BY(product, dbus)      AS primary_product,\n",
+        "    SUM(CASE WHEN billing_type = 'Billed' THEN dbus ELSE 0 END) AS billed_dbus,\n",
+        "    SUM(CASE WHEN billing_type = 'Free'   THEN dbus ELSE 0 END) AS free_dbus,\n",
+        "    SUM(billed_cost_usd)    AS billed_cost_usd,\n",
+        "    SUM(est_free_value_usd) AS est_free_value_usd\n",
+        "  FROM genie_costed\n",
+        "  WHERE principal_type = 'User'\n",
+        "  GROUP BY user_name\n",
+        "),\n",
+        "cutoff AS (\n",
+        "  SELECT percentile_approx(billed_cost_usd, 0.75) AS p75 FROM per_user WHERE billed_cost_usd > 0\n",
+        ")\n",
+        "SELECT\n",
+        "  u.user_name,\n",
+        "  COALESCE(w.workspace_name, CAST(u.primary_workspace_id AS STRING)) AS primary_workspace,\n",
+        "  u.primary_product,\n",
+        "  u.billed_dbus,\n",
+        "  u.free_dbus,\n",
+        "  u.billed_cost_usd,\n",
+        "  u.est_free_value_usd,\n",
+        "  CASE\n",
+        "    WHEN u.billed_cost_usd <= 0 THEN '1 AI beginners'\n",
+        "    WHEN u.billed_cost_usd <= c.p75 THEN '2 AI practitioners'\n",
+        "    ELSE '3 AI power users'\n",
+        "  END AS tier,\n",
+        "  DENSE_RANK() OVER (ORDER BY ws.ws_users DESC, u.primary_workspace_id) AS workspace_rank\n",
+        "FROM per_user u\n",
+        "CROSS JOIN cutoff c\n",
+        "JOIN (SELECT primary_workspace_id, COUNT(*) AS ws_users FROM per_user GROUP BY 1) ws\n",
+        "  ON ws.primary_workspace_id = u.primary_workspace_id\n",
+        "LEFT JOIN workspaces w ON w.workspace_id = u.primary_workspace_id\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_tier_summary",
+      "displayName": "Tier summary and forecast",
+      "queryLines": [
+        "WITH\n",
+        "genie_rows AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.workspace_id,\n",
+        "    u.account_id,\n",
+        "    u.cloud,\n",
+        "    u.sku_name,\n",
+        "    u.usage_unit,\n",
+        "    u.usage_end_time,\n",
+        "    u.identity_metadata.run_as AS user_name,\n",
+        "    CASE WHEN u.identity_metadata.run_as LIKE '%@%' THEN 'User' ELSE 'Service principal' END AS principal_type,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_CODE'   THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE'    THEN 'Genie One'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Other')\n",
+        "    END AS product,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, 'UNKNOWN') AS channel,\n",
+        "    CASE WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN 'Free' ELSE 'Billed' END AS billing_type,\n",
+        "    u.usage_quantity AS dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  WHERE u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date BETWEEN :period.min AND :period.max\n",
+        "),\n",
+        "genie_priced AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN COALESCE(ap.pricing.default, lp.pricing.effective_list.default) END AS billed_unit_price_usd,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN r.dbus * COALESCE(ap.pricing.default, lp.pricing.effective_list.default)\n",
+        "         ELSE 0 END AS billed_cost_usd\n",
+        "  FROM genie_rows r\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = r.account_id\n",
+        "    AND ap.sku_name = r.sku_name\n",
+        "    AND ap.cloud = r.cloud\n",
+        "    AND ap.usage_unit = r.usage_unit\n",
+        "    AND ap.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= ap.price_start_time\n",
+        "    AND (ap.price_end_time IS NULL OR r.usage_end_time < ap.price_end_time)\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = r.sku_name\n",
+        "    AND lp.cloud = r.cloud\n",
+        "    AND lp.usage_unit = r.usage_unit\n",
+        "    AND lp.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= lp.price_start_time\n",
+        "    AND (lp.price_end_time IS NULL OR r.usage_end_time < lp.price_end_time)\n",
+        "),\n",
+        "proxy_sku AS (\n",
+        "  SELECT workspace_id, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY workspace_id\n",
+        "),\n",
+        "proxy_sku_cloud AS (\n",
+        "  SELECT cloud, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY cloud\n",
+        "),\n",
+        "free_priced AS (\n",
+        "  SELECT\n",
+        "    f.workspace_id,\n",
+        "    f.cloud,\n",
+        "    f.account_id,\n",
+        "    COALESCE(ps.sku_name, pc.sku_name) AS proxy_sku_name\n",
+        "  FROM (SELECT DISTINCT workspace_id, cloud, account_id FROM genie_rows WHERE billing_type = 'Free') f\n",
+        "  LEFT JOIN proxy_sku ps ON ps.workspace_id = f.workspace_id\n",
+        "  LEFT JOIN proxy_sku_cloud pc ON pc.cloud = f.cloud\n",
+        "),\n",
+        "free_unit_price AS (\n",
+        "  SELECT\n",
+        "    fp.workspace_id,\n",
+        "    COALESCE(ap.pricing.default, lp.pricing.effective_list.default) AS usd_per_dbu\n",
+        "  FROM free_priced fp\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = fp.account_id AND ap.sku_name = fp.proxy_sku_name AND ap.cloud = fp.cloud\n",
+        "    AND ap.currency_code = 'USD' AND ap.price_end_time IS NULL\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = fp.proxy_sku_name AND lp.cloud = fp.cloud\n",
+        "    AND lp.currency_code = 'USD' AND lp.price_end_time IS NULL\n",
+        "),\n",
+        "genie_costed AS (\n",
+        "  SELECT\n",
+        "    p.*,\n",
+        "    CASE WHEN p.billing_type = 'Free'\n",
+        "         THEN p.dbus * fup.usd_per_dbu\n",
+        "         ELSE 0 END AS est_free_value_usd,\n",
+        "    CASE WHEN p.billing_type = 'Billed' THEN p.billed_unit_price_usd ELSE fup.usd_per_dbu END AS unit_price_usd\n",
+        "  FROM genie_priced p\n",
+        "  LEFT JOIN free_unit_price fup ON fup.workspace_id = p.workspace_id\n",
+        "),\n",
+        "workspaces AS (\n",
+        "  SELECT workspace_id, workspace_name FROM system.access.workspaces_latest\n",
+        "),\n",
+        "period_days AS (\n",
+        "  SELECT GREATEST(DATEDIFF(LEAST(CAST(:period.max AS DATE), current_date()), CAST(:period.min AS DATE)) + 1, 1) AS days\n",
+        "),\n",
+        "per_user AS (\n",
+        "  SELECT user_name, SUM(billed_cost_usd) AS billed_cost_usd\n",
+        "  FROM genie_costed WHERE principal_type = 'User' GROUP BY user_name\n",
+        "),\n",
+        "cutoff AS (\n",
+        "  SELECT percentile_approx(billed_cost_usd, 0.75) AS p75 FROM per_user WHERE billed_cost_usd > 0\n",
+        "),\n",
+        "tiered AS (\n",
+        "  SELECT\n",
+        "    u.*,\n",
+        "    CASE\n",
+        "      WHEN u.billed_cost_usd <= 0 THEN '1 AI beginners'\n",
+        "      WHEN u.billed_cost_usd <= c.p75 THEN '2 AI practitioners'\n",
+        "      ELSE '3 AI power users'\n",
+        "    END AS tier\n",
+        "  FROM per_user u CROSS JOIN cutoff c\n",
+        ")\n",
+        "SELECT\n",
+        "  t.tier,\n",
+        "  COUNT(*) AS users,\n",
+        "  COUNT(*) / SUM(COUNT(*)) OVER () AS pct_users,\n",
+        "  SUM(t.billed_cost_usd) AS billed_cost_usd,\n",
+        "  SUM(t.billed_cost_usd) / NULLIF(SUM(SUM(t.billed_cost_usd)) OVER (), 0) AS pct_spend,\n",
+        "  percentile_approx(t.billed_cost_usd, 0.5)  * 30 / MAX(d.days) AS median_monthly_cost_usd,\n",
+        "  percentile_approx(t.billed_cost_usd, 0.75) * 30 / MAX(d.days) AS p75_monthly_cost_usd,\n",
+        "  SUM(t.billed_cost_usd) * 30 / MAX(d.days) AS projected_monthly_cost_usd\n",
+        "FROM tiered t\n",
+        "CROSS JOIN period_days d\n",
+        "GROUP BY t.tier\n",
+        "ORDER BY t.tier\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_top_users",
+      "displayName": "Top identities by billed spend",
+      "queryLines": [
+        "WITH\n",
+        "genie_rows AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.workspace_id,\n",
+        "    u.account_id,\n",
+        "    u.cloud,\n",
+        "    u.sku_name,\n",
+        "    u.usage_unit,\n",
+        "    u.usage_end_time,\n",
+        "    u.identity_metadata.run_as AS user_name,\n",
+        "    CASE WHEN u.identity_metadata.run_as LIKE '%@%' THEN 'User' ELSE 'Service principal' END AS principal_type,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_CODE'   THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE'    THEN 'Genie One'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Other')\n",
+        "    END AS product,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, 'UNKNOWN') AS channel,\n",
+        "    CASE WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN 'Free' ELSE 'Billed' END AS billing_type,\n",
+        "    u.usage_quantity AS dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  WHERE u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date BETWEEN :period.min AND :period.max\n",
+        "),\n",
+        "genie_priced AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN COALESCE(ap.pricing.default, lp.pricing.effective_list.default) END AS billed_unit_price_usd,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN r.dbus * COALESCE(ap.pricing.default, lp.pricing.effective_list.default)\n",
+        "         ELSE 0 END AS billed_cost_usd\n",
+        "  FROM genie_rows r\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = r.account_id\n",
+        "    AND ap.sku_name = r.sku_name\n",
+        "    AND ap.cloud = r.cloud\n",
+        "    AND ap.usage_unit = r.usage_unit\n",
+        "    AND ap.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= ap.price_start_time\n",
+        "    AND (ap.price_end_time IS NULL OR r.usage_end_time < ap.price_end_time)\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = r.sku_name\n",
+        "    AND lp.cloud = r.cloud\n",
+        "    AND lp.usage_unit = r.usage_unit\n",
+        "    AND lp.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= lp.price_start_time\n",
+        "    AND (lp.price_end_time IS NULL OR r.usage_end_time < lp.price_end_time)\n",
+        "),\n",
+        "proxy_sku AS (\n",
+        "  SELECT workspace_id, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY workspace_id\n",
+        "),\n",
+        "proxy_sku_cloud AS (\n",
+        "  SELECT cloud, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY cloud\n",
+        "),\n",
+        "free_priced AS (\n",
+        "  SELECT\n",
+        "    f.workspace_id,\n",
+        "    f.cloud,\n",
+        "    f.account_id,\n",
+        "    COALESCE(ps.sku_name, pc.sku_name) AS proxy_sku_name\n",
+        "  FROM (SELECT DISTINCT workspace_id, cloud, account_id FROM genie_rows WHERE billing_type = 'Free') f\n",
+        "  LEFT JOIN proxy_sku ps ON ps.workspace_id = f.workspace_id\n",
+        "  LEFT JOIN proxy_sku_cloud pc ON pc.cloud = f.cloud\n",
+        "),\n",
+        "free_unit_price AS (\n",
+        "  SELECT\n",
+        "    fp.workspace_id,\n",
+        "    COALESCE(ap.pricing.default, lp.pricing.effective_list.default) AS usd_per_dbu\n",
+        "  FROM free_priced fp\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = fp.account_id AND ap.sku_name = fp.proxy_sku_name AND ap.cloud = fp.cloud\n",
+        "    AND ap.currency_code = 'USD' AND ap.price_end_time IS NULL\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = fp.proxy_sku_name AND lp.cloud = fp.cloud\n",
+        "    AND lp.currency_code = 'USD' AND lp.price_end_time IS NULL\n",
+        "),\n",
+        "genie_costed AS (\n",
+        "  SELECT\n",
+        "    p.*,\n",
+        "    CASE WHEN p.billing_type = 'Free'\n",
+        "         THEN p.dbus * fup.usd_per_dbu\n",
+        "         ELSE 0 END AS est_free_value_usd,\n",
+        "    CASE WHEN p.billing_type = 'Billed' THEN p.billed_unit_price_usd ELSE fup.usd_per_dbu END AS unit_price_usd\n",
+        "  FROM genie_priced p\n",
+        "  LEFT JOIN free_unit_price fup ON fup.workspace_id = p.workspace_id\n",
+        "),\n",
+        "workspaces AS (\n",
+        "  SELECT workspace_id, workspace_name FROM system.access.workspaces_latest\n",
+        "),\n",
+        "period_days AS (\n",
+        "  SELECT GREATEST(DATEDIFF(LEAST(CAST(:period.max AS DATE), current_date()), CAST(:period.min AS DATE)) + 1, 1) AS days\n",
+        "),\n",
+        "top_ids AS (\n",
+        "  SELECT user_name FROM genie_costed\n",
+        "  GROUP BY user_name HAVING SUM(billed_cost_usd) > 0\n",
+        "  ORDER BY SUM(billed_cost_usd) DESC LIMIT 15\n",
+        ")\n",
+        "SELECT c.user_name, c.principal_type, c.product, SUM(c.billed_cost_usd) AS billed_cost_usd\n",
+        "FROM genie_costed c\n",
+        "JOIN top_ids t ON t.user_name = c.user_name\n",
+        "GROUP BY ALL\n",
+        "ORDER BY billed_cost_usd DESC\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ds_cost_drivers",
+      "displayName": "Cost drivers detail",
+      "queryLines": [
+        "WITH\n",
+        "genie_rows AS (\n",
+        "  SELECT\n",
+        "    u.usage_date,\n",
+        "    u.workspace_id,\n",
+        "    u.account_id,\n",
+        "    u.cloud,\n",
+        "    u.sku_name,\n",
+        "    u.usage_unit,\n",
+        "    u.usage_end_time,\n",
+        "    u.identity_metadata.run_as AS user_name,\n",
+        "    CASE WHEN u.identity_metadata.run_as LIKE '%@%' THEN 'User' ELSE 'Service principal' END AS principal_type,\n",
+        "    CASE u.usage_metadata.genie.surface\n",
+        "      WHEN 'GENIE_CODE'   THEN 'Genie Code'\n",
+        "      WHEN 'GENIE_ONE'    THEN 'Genie One'\n",
+        "      WHEN 'GENIE_AGENTS' THEN 'Genie Agents'\n",
+        "      ELSE COALESCE(u.usage_metadata.genie.surface, 'Other')\n",
+        "    END AS product,\n",
+        "    COALESCE(u.usage_metadata.genie.channel, 'UNKNOWN') AS channel,\n",
+        "    CASE WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN 'Free' ELSE 'Billed' END AS billing_type,\n",
+        "    u.usage_quantity AS dbus\n",
+        "  FROM system.billing.usage u\n",
+        "  WHERE u.billing_origin_product = 'GENIE'\n",
+        "    AND u.usage_date BETWEEN :period.min AND :period.max\n",
+        "),\n",
+        "genie_priced AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN COALESCE(ap.pricing.default, lp.pricing.effective_list.default) END AS billed_unit_price_usd,\n",
+        "    CASE WHEN r.billing_type = 'Billed'\n",
+        "         THEN r.dbus * COALESCE(ap.pricing.default, lp.pricing.effective_list.default)\n",
+        "         ELSE 0 END AS billed_cost_usd\n",
+        "  FROM genie_rows r\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = r.account_id\n",
+        "    AND ap.sku_name = r.sku_name\n",
+        "    AND ap.cloud = r.cloud\n",
+        "    AND ap.usage_unit = r.usage_unit\n",
+        "    AND ap.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= ap.price_start_time\n",
+        "    AND (ap.price_end_time IS NULL OR r.usage_end_time < ap.price_end_time)\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = r.sku_name\n",
+        "    AND lp.cloud = r.cloud\n",
+        "    AND lp.usage_unit = r.usage_unit\n",
+        "    AND lp.currency_code = 'USD'\n",
+        "    AND r.usage_end_time >= lp.price_start_time\n",
+        "    AND (lp.price_end_time IS NULL OR r.usage_end_time < lp.price_end_time)\n",
+        "),\n",
+        "proxy_sku AS (\n",
+        "  SELECT workspace_id, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY workspace_id\n",
+        "),\n",
+        "proxy_sku_cloud AS (\n",
+        "  SELECT cloud, MAX_BY(sku_name, usage_end_time) AS sku_name\n",
+        "  FROM genie_rows WHERE billing_type = 'Billed' GROUP BY cloud\n",
+        "),\n",
+        "free_priced AS (\n",
+        "  SELECT\n",
+        "    f.workspace_id,\n",
+        "    f.cloud,\n",
+        "    f.account_id,\n",
+        "    COALESCE(ps.sku_name, pc.sku_name) AS proxy_sku_name\n",
+        "  FROM (SELECT DISTINCT workspace_id, cloud, account_id FROM genie_rows WHERE billing_type = 'Free') f\n",
+        "  LEFT JOIN proxy_sku ps ON ps.workspace_id = f.workspace_id\n",
+        "  LEFT JOIN proxy_sku_cloud pc ON pc.cloud = f.cloud\n",
+        "),\n",
+        "free_unit_price AS (\n",
+        "  SELECT\n",
+        "    fp.workspace_id,\n",
+        "    COALESCE(ap.pricing.default, lp.pricing.effective_list.default) AS usd_per_dbu\n",
+        "  FROM free_priced fp\n",
+        "  LEFT JOIN system.billing.account_prices ap\n",
+        "    ON  ap.account_id = fp.account_id AND ap.sku_name = fp.proxy_sku_name AND ap.cloud = fp.cloud\n",
+        "    AND ap.currency_code = 'USD' AND ap.price_end_time IS NULL\n",
+        "  LEFT JOIN system.billing.list_prices lp\n",
+        "    ON  lp.sku_name = fp.proxy_sku_name AND lp.cloud = fp.cloud\n",
+        "    AND lp.currency_code = 'USD' AND lp.price_end_time IS NULL\n",
+        "),\n",
+        "genie_costed AS (\n",
+        "  SELECT\n",
+        "    p.*,\n",
+        "    CASE WHEN p.billing_type = 'Free'\n",
+        "         THEN p.dbus * fup.usd_per_dbu\n",
+        "         ELSE 0 END AS est_free_value_usd,\n",
+        "    CASE WHEN p.billing_type = 'Billed' THEN p.billed_unit_price_usd ELSE fup.usd_per_dbu END AS unit_price_usd\n",
+        "  FROM genie_priced p\n",
+        "  LEFT JOIN free_unit_price fup ON fup.workspace_id = p.workspace_id\n",
+        "),\n",
+        "workspaces AS (\n",
+        "  SELECT workspace_id, workspace_name FROM system.access.workspaces_latest\n",
+        "),\n",
+        "period_days AS (\n",
+        "  SELECT GREATEST(DATEDIFF(LEAST(CAST(:period.max AS DATE), current_date()), CAST(:period.min AS DATE)) + 1, 1) AS days\n",
+        ")\n",
+        "SELECT\n",
+        "  c.user_name,\n",
+        "  c.principal_type,\n",
+        "  COALESCE(w.workspace_name, CAST(c.workspace_id AS STRING)) AS workspace_name,\n",
+        "  c.product,\n",
+        "  c.channel,\n",
+        "  SUM(CASE WHEN c.billing_type = 'Billed' THEN c.dbus ELSE 0 END) AS billed_dbus,\n",
+        "  SUM(CASE WHEN c.billing_type = 'Free'   THEN c.dbus ELSE 0 END) AS free_dbus,\n",
+        "  SUM(c.billed_cost_usd) AS billed_cost_usd,\n",
+        "  SUM(c.est_free_value_usd) AS est_free_value_usd\n",
+        "FROM genie_costed c\n",
+        "LEFT JOIN workspaces w ON w.workspace_id = c.workspace_id\n",
+        "GROUP BY ALL\n",
+        "ORDER BY billed_cost_usd DESC, free_dbus DESC\n",
+        "LIMIT 500\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Date range",
+          "keyword": "period",
+          "dataType": "DATE",
+          "complexType": "RANGE",
+          "defaultSelection": {
+            "range": {
+              "dataType": "DATE",
+              "min": {
+                "value": "now-30d/d"
+              },
+              "max": {
+                "value": "now/d"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "ov-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Genie Usage & Cost\n",
+                "\n",
+                "Genie LLM usage and spend across Genie Code, Genie One, and Genie Agents. Through January 31, 2027, Genie One and Genie Agents are free for named users (service principals are billed); Genie Code is billed after 150 free DBUs per user per month. Use the **Filters** page for date range, workspace, and product."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-billed",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "fields": [
+                    {
+                      "name": "sum(billed_cost_usd)",
+                      "expression": "SUM(`billed_cost_usd`)"
+                    },
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(billed_cost_usd)",
+                  "displayName": "Billed spend",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                },
+                "period": {
+                  "fieldName": "daily(usage_date)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Billed spend",
+                "showDescription": true,
+                "description": "Account price when available, otherwise list price"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-free-value",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "fields": [
+                    {
+                      "name": "sum(est_free_value_usd)",
+                      "expression": "SUM(`est_free_value_usd`)"
+                    },
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(est_free_value_usd)",
+                  "displayName": "Free usage at post-promo price",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                },
+                "period": {
+                  "fieldName": "daily(usage_date)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Free usage at post-promo price",
+                "showDescription": true,
+                "description": "Free DBUs at full price; before the 150 DBU per-user monthly allowance"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "fields": [
+                    {
+                      "name": "countdistinct(user_name)",
+                      "expression": "COUNT(DISTINCT `user_name`)"
+                    },
+                    {
+                      "name": "daily(event_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(user_name)",
+                  "displayName": "Active users"
+                },
+                "period": {
+                  "fieldName": "daily(event_date)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active users",
+                "showDescription": true,
+                "description": "Distinct identities that sent a Genie message"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-messages",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "fields": [
+                    {
+                      "name": "sum(messages)",
+                      "expression": "SUM(`messages`)"
+                    },
+                    {
+                      "name": "daily(event_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(messages)",
+                  "displayName": "Messages",
+                  "format": {
+                    "type": "number",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 1
+                    }
+                  }
+                },
+                "period": {
+                  "fieldName": "daily(event_date)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Messages",
+                "showDescription": true,
+                "description": "Genie Code, Genie Agent, and Genie One messages"
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "ov-sec-spend",
+            "multilineTextboxSpec": {
+              "lines": [
+                "### Spend\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "spend-by-product",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "fields": [
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "sum(billed_cost_usd)",
+                      "expression": "SUM(`billed_cost_usd`)"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(usage_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(billed_cost_usd)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Billed spend",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "product",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Genie Code",
+                        "color": "#2272B4"
+                      },
+                      {
+                        "value": "Genie One",
+                        "color": "#FFAB00"
+                      },
+                      {
+                        "value": "Genie Agents",
+                        "color": "#00A972"
+                      }
+                    ]
+                  },
+                  "displayName": "Product"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily billed spend by product"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "dbus-billed-vs-free",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "fields": [
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "sum(dbus)",
+                      "expression": "SUM(`dbus`)"
+                    },
+                    {
+                      "name": "billing_type",
+                      "expression": "`billing_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(usage_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(dbus)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "DBUs",
+                  "format": {
+                    "type": "number",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 1
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "billing_type",
+                  "displayName": "Usage",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Billed",
+                        "color": "#2272B4"
+                      },
+                      {
+                        "value": "Free",
+                        "color": "#9DB7C9"
+                      }
+                    ]
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily DBUs: billed vs. free",
+                "showDescription": true,
+                "description": "Free DBUs are recorded before the 25% promo; billed DBUs after it"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 6,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ov-sec-adoption",
+            "multilineTextboxSpec": {
+              "lines": [
+                "### Adoption\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "dau-by-product",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "fields": [
+                    {
+                      "name": "daily(event_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+                    },
+                    {
+                      "name": "countdistinct(user_name)",
+                      "expression": "COUNT(DISTINCT `user_name`)"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(event_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "y": {
+                  "fieldName": "countdistinct(user_name)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Active users"
+                },
+                "color": {
+                  "fieldName": "product",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Genie Code",
+                        "color": "#2272B4"
+                      },
+                      {
+                        "value": "Genie One",
+                        "color": "#FFAB00"
+                      },
+                      {
+                        "value": "Genie Agents",
+                        "color": "#00A972"
+                      }
+                    ]
+                  },
+                  "displayName": "Product"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily active users by product"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "mau-by-product",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "fields": [
+                    {
+                      "name": "monthly(event_date)",
+                      "expression": "DATE_TRUNC(\"MONTH\", `event_date`)"
+                    },
+                    {
+                      "name": "countdistinct(user_name)",
+                      "expression": "COUNT(DISTINCT `user_name`)"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "mark": {
+                "layout": "group"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "monthly(event_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "y": {
+                  "fieldName": "countdistinct(user_name)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Active users"
+                },
+                "color": {
+                  "fieldName": "product",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Genie Code",
+                        "color": "#2272B4"
+                      },
+                      {
+                        "value": "Genie One",
+                        "color": "#FFAB00"
+                      },
+                      {
+                        "value": "Genie Agents",
+                        "color": "#00A972"
+                      }
+                    ]
+                  },
+                  "displayName": "Product"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Monthly active users by product",
+                "showDescription": true,
+                "description": "Partial months at the edges of the date range"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 13,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "workspace-users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_workspace_usage",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    },
+                    {
+                      "name": "sum(active_users)",
+                      "expression": "SUM(`active_users`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "sum(active_users)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Active users"
+                },
+                "y": {
+                  "fieldName": "workspace_name",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "value"
+                    }
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active users: top 15 workspaces by messages"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 19,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "workspace-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_workspace_usage",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    },
+                    {
+                      "name": "messages",
+                      "expression": "`messages`"
+                    },
+                    {
+                      "name": "active_users",
+                      "expression": "`active_users`"
+                    },
+                    {
+                      "name": "billed_cost_usd",
+                      "expression": "`billed_cost_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace"
+                  },
+                  {
+                    "fieldName": "messages",
+                    "displayName": "Messages",
+                    "format": {
+                      "type": "number",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "max",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "active_users",
+                    "displayName": "Active users"
+                  },
+                  {
+                    "fieldName": "billed_cost_usd",
+                    "displayName": "Billed spend",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage by workspace (top 15 by messages)"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 19,
+            "width": 6,
+            "height": 7
+          }
+        }
+      ]
+    },
+    {
+      "name": "users_tiers",
+      "displayName": "Users & Tiers",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "ut-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Users & Tiers\n",
+                "\n",
+                "Tiers use billed spend in the selected period, following the Genie consumption guide: **AI beginners** = $0 billed (stayed within free usage); **AI practitioners** = billed, at or below the 75th percentile of billed users; **AI power users** = above it. Human users only."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "tier-users-vs-spend",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_tier_summary",
+                  "fields": [
+                    {
+                      "name": "tier",
+                      "expression": "`tier`"
+                    },
+                    {
+                      "name": "sum(pct_users)",
+                      "expression": "SUM(`pct_users`)"
+                    },
+                    {
+                      "name": "sum(pct_spend)",
+                      "expression": "SUM(`pct_spend`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "mark": {
+                "layout": "group"
+              },
+              "encodings": {
+                "x": {
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 1
+                    }
+                  },
+                  "fields": [
+                    {
+                      "fieldName": "sum(pct_users)",
+                      "displayName": "% of users"
+                    },
+                    {
+                      "fieldName": "sum(pct_spend)",
+                      "displayName": "% of billed spend"
+                    }
+                  ]
+                },
+                "y": {
+                  "fieldName": "tier",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "custom-order",
+                      "orderedValues": [
+                        "1 AI beginners",
+                        "2 AI practitioners",
+                        "3 AI power users"
+                      ]
+                    }
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Share of users vs. share of billed spend by tier"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "tier-summary",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_tier_summary",
+                  "fields": [
+                    {
+                      "name": "tier",
+                      "expression": "`tier`"
+                    },
+                    {
+                      "name": "users",
+                      "expression": "`users`"
+                    },
+                    {
+                      "name": "billed_cost_usd",
+                      "expression": "`billed_cost_usd`"
+                    },
+                    {
+                      "name": "median_monthly_cost_usd",
+                      "expression": "`median_monthly_cost_usd`"
+                    },
+                    {
+                      "name": "p75_monthly_cost_usd",
+                      "expression": "`p75_monthly_cost_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "tier",
+                    "displayName": "Tier"
+                  },
+                  {
+                    "fieldName": "users",
+                    "displayName": "Users"
+                  },
+                  {
+                    "fieldName": "billed_cost_usd",
+                    "displayName": "Billed spend (period)",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "median_monthly_cost_usd",
+                    "displayName": "Median $/user/month",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "p75_monthly_cost_usd",
+                    "displayName": "75th pct $/user/month",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Tier summary",
+                "showDescription": true,
+                "description": "Per-user spend scaled to 30 days"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 2,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "tier-mix-workspace",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_user_tiers",
+                  "fields": [
+                    {
+                      "name": "primary_workspace",
+                      "expression": "`primary_workspace`"
+                    },
+                    {
+                      "name": "count(user_name)",
+                      "expression": "COUNT(`user_name`)"
+                    },
+                    {
+                      "name": "tier",
+                      "expression": "`tier`"
+                    }
+                  ],
+                  "disaggregated": false,
+                  "filters": [
+                    {
+                      "expression": "`workspace_rank` <= 10"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "mark": {
+                "layout": "stack-100"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "count(user_name)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Share of users",
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 1
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "primary_workspace",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "color": {
+                  "fieldName": "tier",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "1 AI beginners",
+                        "color": "#9DB7C9"
+                      },
+                      {
+                        "value": "2 AI practitioners",
+                        "color": "#2272B4"
+                      },
+                      {
+                        "value": "3 AI power users",
+                        "color": "#98102A"
+                      }
+                    ],
+                    "sort": {
+                      "by": "custom-order",
+                      "orderedValues": [
+                        "1 AI beginners",
+                        "2 AI practitioners",
+                        "3 AI power users"
+                      ]
+                    }
+                  },
+                  "displayName": "Tier"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Tier mix by workspace (top 10 by users)",
+                "showDescription": true,
+                "description": "Workspace stands in for team until a user-to-team mapping from Entra groups is added"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 12,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "user-heatmap",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_user_heatmap",
+                  "fields": [
+                    {
+                      "name": "day_label",
+                      "expression": "`day_label`"
+                    },
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    },
+                    {
+                      "name": "sum(messages)",
+                      "expression": "SUM(`messages`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "heatmap",
+              "encodings": {
+                "x": {
+                  "fieldName": "day_label",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "alphabetical"
+                    }
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "y": {
+                  "fieldName": "user_name",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "color": {
+                  "fieldName": "sum(messages)",
+                  "displayName": "Messages",
+                  "scale": {
+                    "type": "quantitative",
+                    "colorRamp": {
+                      "mode": "custom-sequential",
+                      "colors": {
+                        "start": "#E8F1F8",
+                        "end": "#1B3139"
+                      }
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily messages: top 25 users",
+                "showDescription": true,
+                "description": "All Genie products. High daily counts usually indicate API or automated use"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 15,
+            "width": 12,
+            "height": 9
+          }
+        }
+      ]
+    },
+    {
+      "name": "cost_drivers",
+      "displayName": "Cost Drivers",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "cd-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Cost Drivers\n",
+                "\n",
+                "Who drives Genie LLM spend. Genie LLM billing is recorded per identity, day, product, and channel; it does not include query type or duration."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "top-identities",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_top_users",
+                  "fields": [
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    },
+                    {
+                      "name": "sum(billed_cost_usd)",
+                      "expression": "SUM(`billed_cost_usd`)"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "sum(billed_cost_usd)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Billed spend",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "user_name",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "value"
+                    }
+                  },
+                  "axis": {
+                    "hideTitle": true
+                  }
+                },
+                "color": {
+                  "fieldName": "product",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Genie Code",
+                        "color": "#2272B4"
+                      },
+                      {
+                        "value": "Genie One",
+                        "color": "#FFAB00"
+                      },
+                      {
+                        "value": "Genie Agents",
+                        "color": "#00A972"
+                      }
+                    ]
+                  },
+                  "displayName": "Product"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 15 identities by billed spend"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "cost-driver-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_cost_drivers",
+                  "fields": [
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    },
+                    {
+                      "name": "principal_type",
+                      "expression": "`principal_type`"
+                    },
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    },
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    },
+                    {
+                      "name": "channel",
+                      "expression": "`channel`"
+                    },
+                    {
+                      "name": "billed_cost_usd",
+                      "expression": "`billed_cost_usd`"
+                    },
+                    {
+                      "name": "billed_dbus",
+                      "expression": "`billed_dbus`"
+                    },
+                    {
+                      "name": "free_dbus",
+                      "expression": "`free_dbus`"
+                    },
+                    {
+                      "name": "est_free_value_usd",
+                      "expression": "`est_free_value_usd`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "user_name",
+                    "displayName": "Identity"
+                  },
+                  {
+                    "fieldName": "principal_type",
+                    "displayName": "Type"
+                  },
+                  {
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace"
+                  },
+                  {
+                    "fieldName": "product",
+                    "displayName": "Product"
+                  },
+                  {
+                    "fieldName": "channel",
+                    "displayName": "Channel"
+                  },
+                  {
+                    "fieldName": "billed_cost_usd",
+                    "displayName": "Billed spend",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "billed_dbus",
+                    "displayName": "Billed DBUs",
+                    "format": {
+                      "type": "number",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "max",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "free_dbus",
+                    "displayName": "Free DBUs",
+                    "format": {
+                      "type": "number",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "max",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "est_free_value_usd",
+                    "displayName": "Free usage at post-promo price",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Spend detail by identity, workspace, product, and channel",
+                "showDescription": true,
+                "description": "Top 500 rows"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 2,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "cd-notes",
+            "multilineTextboxSpec": {
+              "lines": [
+                "#### Notes\n",
+                "\n",
+                "- **Pricing:** account price (system.billing.account_prices) when available, otherwise list price. Genie's 25% promo is already applied in billed DBUs.\n",
+                "- **Free usage at post-promo price:** free Genie DBUs priced at the workspace's billed Genie SKU with no promo discount. Estimate; does not subtract the free monthly allowance.\n",
+                "- **Scope:** Genie LLM costs only. Compute that Genie triggers (for example, SQL warehouses) is billed separately and is planned for Phase 2.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 10,
+            "width": 12,
+            "height": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "filters",
+      "displayName": "Filters",
+      "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "filter-period",
+            "queries": [
+              {
+                "name": "p_ds_spend_daily",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_activity_daily",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_workspace_usage",
+                "query": {
+                  "datasetName": "ds_workspace_usage",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_user_heatmap",
+                "query": {
+                  "datasetName": "ds_user_heatmap",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_user_tiers",
+                "query": {
+                  "datasetName": "ds_user_tiers",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_tier_summary",
+                "query": {
+                  "datasetName": "ds_tier_summary",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_top_users",
+                "query": {
+                  "datasetName": "ds_top_users",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_ds_cost_drivers",
+                "query": {
+                  "datasetName": "ds_cost_drivers",
+                  "parameters": [
+                    {
+                      "name": "period",
+                      "keyword": "period"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_spend_daily"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_activity_daily"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_workspace_usage"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_user_heatmap"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_user_tiers"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_tier_summary"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_top_users"
+                  },
+                  {
+                    "parameterName": "period",
+                    "queryName": "p_ds_cost_drivers"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Date range"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter-workspace",
+            "queries": [
+              {
+                "name": "f_ds_spend_daily",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ds_activity_daily",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ds_cost_drivers",
+                "query": {
+                  "datasetName": "ds_cost_drivers",
+                  "fields": [
+                    {
+                      "name": "workspace_name",
+                      "expression": "`workspace_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace",
+                    "queryName": "f_ds_spend_daily"
+                  },
+                  {
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace",
+                    "queryName": "f_ds_activity_daily"
+                  },
+                  {
+                    "fieldName": "workspace_name",
+                    "displayName": "Workspace",
+                    "queryName": "f_ds_cost_drivers"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter-product",
+            "queries": [
+              {
+                "name": "f_ds_spend_daily",
+                "query": {
+                  "datasetName": "ds_spend_daily",
+                  "fields": [
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ds_activity_daily",
+                "query": {
+                  "datasetName": "ds_activity_daily",
+                  "fields": [
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ds_top_users",
+                "query": {
+                  "datasetName": "ds_top_users",
+                  "fields": [
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ds_cost_drivers",
+                "query": {
+                  "datasetName": "ds_cost_drivers",
+                  "fields": [
+                    {
+                      "name": "product",
+                      "expression": "`product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "product",
+                    "displayName": "Genie product",
+                    "queryName": "f_ds_spend_daily"
+                  },
+                  {
+                    "fieldName": "product",
+                    "displayName": "Genie product",
+                    "queryName": "f_ds_activity_daily"
+                  },
+                  {
+                    "fieldName": "product",
+                    "displayName": "Genie product",
+                    "queryName": "f_ds_top_users"
+                  },
+                  {
+                    "fieldName": "product",
+                    "displayName": "Genie product",
+                    "queryName": "f_ds_cost_drivers"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie product"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 4,
+            "height": 2
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#F9F7F4",
+        "dark": "#0B2026"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#1B3139"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#1B3139"
+      },
+      "fontColor": {
+        "light": "#1B3139",
+        "dark": "#EEEDE9"
+      },
+      "selectionColor": {
+        "light": "#2272B4",
+        "dark": "#8ACAFF"
+      },
+      "visualizationColors": [
+        "#2272B4",
+        "#FFAB00",
+        "#00A972",
+        "#98102A",
+        "#5A6F77",
+        "#FF5F46",
+        "#9DB7C9"
+      ],
+      "widgetHeaderAlignment": "LEFT"
+    }
+  }
+}
